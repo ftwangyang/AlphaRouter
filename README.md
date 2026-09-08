@@ -40,7 +40,7 @@ To fully reproduce the AlphaRouter experiments, run the following commands seque
    `
 
 2. **Run committee evaluation**:
-   `ash
+   `bash
    python -m alpharouter.committee_experiment --seeds 101 202 303 404 505 --device auto
    `
 
