@@ -4,7 +4,7 @@ AlphaRouter is a dynamic portfolio routing system that uses a Transformer model 
 
 ## Project Structure
 
-- lpharouter/
+- Alpharouter/
   - model.py - Implements the Transformer router and shared per-expert evidence scorer.
   - experiment.py - Builds causal daily utility labels, trains independent routers, and selects checkpoints using validation data.
   - committee_experiment.py - Calibrates dynamic share and switching margin on validation data, and applies unanimous hard consensus.
@@ -15,7 +15,7 @@ AlphaRouter is a dynamic portfolio routing system that uses a Transformer model 
 
 Install the required dependencies:
 
-`ash
+`bash
 pip install -r requirements.txt
 `
 
@@ -24,18 +24,18 @@ pip install -r requirements.txt
 The datasets are not included in this repository to keep it lightweight. The experiments run on four public proxy panels (DJIA29, HSI56, CSI98, CRYPTO18) constructed using the AlphaGAT methodology.
 
 **How to get the data:**
-1. Download the pre-processed .npz files (e.g., lphagat_djia29_frozen_extended_20260808.npz and lphagat_djia29_public_2010_2023.npz) from the official AlphaGAT data releases or public drive links.
+1. Download the pre-processed .npz files (e.g., Alphagat_djia29_frozen_extended_20260808.npz and lphagat_djia29_public_2010_2023.npz) from the official AlphaGAT data releases or public drive links.
 2. Create a folder named data/ in the root of this project.
 3. Place all downloaded .npz files into the data/ directory.
 
-The lpharouter/config.py file maps each market configuration to the expected filenames in the data/ directory.
+The Alpharouter/config.py file maps each market configuration to the expected filenames in the data/ directory.
 
 ## Running the Experiments
 
 To fully reproduce the AlphaRouter experiments, run the following commands sequentially:
 
 1. **Train the models** (Trains 5 independent routers across 4 datasets):
-   `ash
+   `bash
    python -m alpharouter.experiment --seeds 101 202 303 404 505 --epochs 100 --device auto
    `
 
@@ -45,7 +45,7 @@ To fully reproduce the AlphaRouter experiments, run the following commands seque
    `
 
 3. **Generate final report**:
-   `ash
+   `bash
    python -m alpharouter.final_report
    `
 
@@ -53,7 +53,7 @@ To fully reproduce the AlphaRouter experiments, run the following commands seque
 
 Ensure code correctness by running the tests. The tests use deterministically generated synthetic data, so you can run them even without downloading the actual datasets:
 
-`ash
+`bash
 pytest -q tests/test_alpharouter_dynamic.py
 `
 
