@@ -24,7 +24,7 @@ pip install -r requirements.txt
 The datasets are not included in this repository to keep it lightweight. The experiments run on four public proxy panels (DJIA29, HSI56, CSI98, CRYPTO18) constructed using the AlphaGAT methodology.
 
 **How to get the data:**
-1. Download the pre-processed .npz files (e.g., Alphagat_djia29_frozen_extended_20260808.npz and lphagat_djia29_public_2010_2023.npz) from the official AlphaGAT data releases or public drive links.
+1. Download the pre-processed .npz files (e.g., Alphagat_djia29_frozen_extended_20260808.npz and Alphagat_djia29_public_2010_2023.npz) from the official AlphaGAT data releases or public drive links.
 2. Create a folder named data/ in the root of this project.
 3. Place all downloaded .npz files into the data/ directory.
 
