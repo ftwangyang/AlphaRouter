@@ -36,4 +36,4 @@ Keep source code and input data unchanged between training and evaluation. Use `
 
 ## Evaluation note
 
-The 2024–2025 data were used during development, so evaluation is retrospective. Reported paper results have not been revalidated with this revision. See [implementation notes](docs/IMPLEMENTATION_RECONCILIATION.md) for details.
+The 2024–2025 data were used during development, so evaluation is retrospective. Reported paper results have not been revalidated with this revision.
