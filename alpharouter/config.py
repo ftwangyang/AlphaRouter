@@ -31,28 +31,11 @@ def dataset_configuration(
     dataset: str,
     data_dir: str | Path = "data",
 ) -> Dict[str, Any]:
-    """Build a leakage-safe data configuration for one experiment panel.
-
-    ``synthetic`` is a deterministic, offline dataset intended for smoke tests.
-    The four research panels use the same chronological boundaries as the
-    reported AlphaRouter experiments.
-    """
-    if dataset == "synthetic":
-        return {
-            "seed": 7,
-            "data": {
-                "source": "synthetic",
-                "length": 480,
-                "num_assets": 8,
-                "train_ratio": 0.60,
-                "val_ratio": 0.20,
-            },
-        }
-
+    """Build a chronological data configuration for one research panel."""
     try:
         panel_name, reference_name = _PANELS[dataset]
     except KeyError as error:
-        supported = ", ".join((*DEFAULT_DATASETS, "synthetic"))
+        supported = ", ".join(DEFAULT_DATASETS)
         raise KeyError(
             f"unknown dataset {dataset!r}; choose one of: {supported}"
         ) from error

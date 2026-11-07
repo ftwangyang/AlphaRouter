@@ -101,7 +101,7 @@ def _load_npz_arrays(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, list[str], list[str]]:
     if not path.is_file():
         raise FileNotFoundError(
-            f"market panel not found: {path}. See data/README.md for the expected files."
+            f"market panel not found: {path}. See the repository README for required data files."
         )
     payload = np.load(path, allow_pickle=False)
     features = payload["features"].astype(np.float64)
@@ -114,6 +114,10 @@ def _load_npz_arrays(
     ]
     if features.shape[:2] != returns.shape or features.shape[0] != len(dates):
         raise ValueError(f"inconsistent arrays in {path}")
+    if features.ndim != 3 or returns.ndim != 2 or returns.shape[1] != len(tickers):
+        raise ValueError(f"invalid asset or feature dimensions in {path}")
+    if not np.isfinite(returns).all() or np.any(returns <= -1.0):
+        raise ValueError(f"returns in {path} must be finite and greater than -1")
     if np.any(np.diff(dates) <= np.timedelta64(0, "D")):
         raise ValueError(f"dates in {path} must be strictly increasing")
     return features, returns, dates, tickers, feature_names
@@ -155,63 +159,6 @@ def _align_to_reference(
     aligned_returns = returns.copy()
     aligned_returns[current_index] = ref_returns[reference_index]
     return aligned, aligned_returns, ref_features, ref_dates
-
-
-def make_synthetic_market(
-    length: int = 480,
-    num_assets: int = 8,
-    seed: int = 7,
-    train_ratio: float = 0.60,
-    val_ratio: float = 0.20,
-) -> MarketDataBundle:
-    """Create a deterministic regime-switching panel for offline smoke tests."""
-    rng = np.random.default_rng(seed)
-    regimes = np.zeros(length, dtype=np.int64)
-    for index in range(1, length):
-        regimes[index] = (
-            regimes[index - 1] if rng.random() > 0.035 else 1 - regimes[index - 1]
-        )
-    market = rng.normal(
-        np.where(regimes == 0, 0.0005, -0.00015),
-        np.where(regimes == 0, 0.008, 0.016),
-    )
-    loadings = rng.uniform(0.35, 1.15, size=num_assets)
-    idiosyncratic = rng.normal(
-        0.0,
-        rng.uniform(0.006, 0.014, size=num_assets),
-        size=(length, num_assets),
-    )
-    returns = market[:, None] * loadings[None, :] + idiosyncratic
-    momentum = np.zeros((length, num_assets))
-    for index in range(2, length):
-        momentum[index] = 0.12 * returns[index - 1] - 0.05 * returns[index - 2]
-    returns = np.clip(returns + momentum, -0.18, 0.18).astype(np.float32)
-
-    close = 50.0 * np.exp(np.cumsum(np.log1p(returns), axis=0))
-    overnight = rng.normal(0.0, 0.0025, size=close.shape)
-    open_price = close / (1.0 + returns) * (1.0 + overnight)
-    spread = np.abs(rng.normal(0.006, 0.003, size=close.shape))
-    high = np.maximum(open_price, close) * (1.0 + spread)
-    low = np.minimum(open_price, close) * (1.0 - spread)
-    volume = rng.lognormal(mean=15.0, sigma=0.45, size=close.shape)
-    vwap = (high + low + close) / 3.0
-    turn = volume / np.maximum(1.0, np.vstack([volume[:1], volume[:-1]]))
-    raw_features = np.stack(
-        [open_price, close, high, low, volume, vwap, turn, returns], axis=-1
-    )
-    bounds = _split_bounds(length, train_ratio, val_ratio)
-    mean, std = _fit_normalizer(raw_features, bounds["train"][1])
-    dates = np.datetime64("2018-01-02") + np.arange(length).astype("timedelta64[D]")
-    return MarketDataBundle(
-        features=_apply_normalizer(raw_features, mean, std),
-        returns=returns,
-        dates=dates,
-        tickers=[f"ASSET_{index:02d}" for index in range(num_assets)],
-        feature_names=list(FEATURE_NAMES),
-        split_indices=bounds,
-        mean=mean.reshape(-1),
-        std=std.reshape(-1),
-    )
 
 
 def load_npz_market(
@@ -271,15 +218,7 @@ def load_npz_market(
 
 def load_market_data(config: Dict) -> MarketDataBundle:
     data_config = config["data"]
-    source = data_config.get("source", "synthetic")
-    if source == "synthetic":
-        return make_synthetic_market(
-            length=int(data_config.get("length", 480)),
-            num_assets=int(data_config.get("num_assets", 8)),
-            seed=int(config.get("seed", 7)),
-            train_ratio=float(data_config.get("train_ratio", 0.60)),
-            val_ratio=float(data_config.get("val_ratio", 0.20)),
-        )
+    source = data_config.get("source", "npz")
     if source == "npz":
         return load_npz_market(
             data_config["path"],
@@ -291,7 +230,7 @@ def load_market_data(config: Dict) -> MarketDataBundle:
             test_end=data_config.get("test_end"),
             normalization_reference=data_config.get("normalization_reference"),
         )
-    raise ValueError(f"unknown data source {source!r}; expected 'synthetic' or 'npz'")
+    raise ValueError(f"unknown data source {source!r}; expected 'npz'")
 
 
 class MarketWindowDataset(Dataset):
@@ -304,6 +243,8 @@ class MarketWindowDataset(Dataset):
         window: int,
         horizon: int = 1,
     ) -> None:
+        if window < 1 or horizon < 1:
+            raise ValueError("window and horizon must be positive")
         if split not in bundle.split_indices:
             raise KeyError(f"unknown split {split!r}")
         split_start, split_end = bundle.split_indices[split]

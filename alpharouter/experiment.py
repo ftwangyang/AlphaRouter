@@ -21,10 +21,17 @@ from torch.utils.data import DataLoader, Dataset
 
 from .config import DEFAULT_DATASETS, dataset_configuration
 from .data import MarketDataBundle, MarketWindowDataset, load_market_data
-from .experts import expert_parameters, profile_weights
+from .experts import expert_parameters, generate_expert_weights
 from .model import DynamicExpertRouter
-from .portfolio import (backtest_metrics, ensure_dir, save_backtest_tables,
-                        save_json, seed_everything, simulate_portfolio)
+from .portfolio import (
+    backtest_metrics,
+    ensure_dir,
+    save_json,
+    seed_everything,
+    simulate_portfolio,
+)
+from .protocol import IMPLEMENTATION_ID, bundle_fingerprint, source_fingerprint
+from .routing import member_gate
 
 METHOD = "AlphaRouter-S"
 DATASETS = DEFAULT_DATASETS
@@ -34,8 +41,8 @@ EXPERT_NAMES = (
     "fast_sparse",
     "adaptive_dense",
 )
-ROOT = Path("outputs/alpharouter_members")
-CACHE_ROOT = Path("outputs/cache")
+ROOT = Path("outputs/alpharouter_members_paper")
+CACHE_ROOT = Path("outputs/cache_paper")
 COST = 0.0025
 
 
@@ -52,7 +59,6 @@ class TrainingParameters:
     learning_rate: float = 5e-4
     weight_decay: float = 1e-4
     utility_weight: float = 0.25
-    soft_target_weight: float = 1.00
     utility_temperature: float = 0.75
     downside_weight: float = 0.25
     drawdown_weight: float = 0.10
@@ -76,8 +82,6 @@ class TrainingParameters:
             raise ValueError(
                 "learning_rate must be positive and weight_decay non-negative"
             )
-        if not 0.0 <= self.soft_target_weight <= 1.0:
-            raise ValueError("soft_target_weight must lie in [0, 1]")
         if self.utility_temperature <= 0.0:
             raise ValueError("utility_temperature must be positive")
 
@@ -99,10 +103,10 @@ class JointRouterDataset(Dataset):
         self.state = np.concatenate([panel.state for panel in panels]).astype(
             np.float32
         )
-        utility = np.concatenate([panel.utility for panel in panels]).astype(np.float32)
-        center = utility.mean(axis=1, keepdims=True)
-        scale = utility.std(axis=1, keepdims=True)
-        self.utility = np.clip((utility - center) / np.maximum(scale, 1e-5), -5.0, 5.0)
+        # Eqs. (12)-(13) use raw Eq. (11) scores, without a date-wise z-score.
+        self.utility = np.concatenate([panel.utility for panel in panels]).astype(
+            np.float32
+        )
         self.label = np.concatenate([panel.label for panel in panels]).astype(np.int64)
 
     def __len__(self) -> int:
@@ -119,21 +123,20 @@ class JointRouterDataset(Dataset):
 def _market_state(
     bundle: MarketDataBundle, indices: np.ndarray, window: int
 ) -> np.ndarray:
-    """Return 21 causal return descriptors without a market identity channel."""
-    output = np.empty((len(indices), window, 21), dtype=np.float32)
-    for row, target in enumerate(indices):
-        values = bundle.returns[int(target) - window : int(target)].astype(np.float64)
-        output[row, :, 0] = values.mean(axis=1)
-        output[row, :, 1] = values.std(axis=1)
-        output[row, :, 2] = np.quantile(values, 0.10, axis=1)
-        output[row, :, 3] = np.quantile(values, 0.50, axis=1)
-        output[row, :, 4] = np.quantile(values, 0.90, axis=1)
-        output[row, :, 5] = (values > 0.0).mean(axis=1)
+    """Return Eq. (10)'s past daily states, each causal at its own date."""
+    last = int(indices[-1])
+    daily = np.empty((last, 21), dtype=np.float32)
+    values = bundle.returns[:last].astype(np.float64)
+    daily[:, 0] = values.mean(axis=1)
+    daily[:, 1] = values.std(axis=1)
+    daily[:, 2] = np.quantile(values, 0.10, axis=1)
+    daily[:, 3] = np.quantile(values, 0.50, axis=1)
+    daily[:, 4] = np.quantile(values, 0.90, axis=1)
+    daily[:, 5] = (values > 0.0).mean(axis=1)
+    for date in range(last):
         descriptors: list[float] = []
         for horizon in (20, 60, 220):
-            history = bundle.returns[
-                max(0, int(target) - horizon) : int(target)
-            ].astype(np.float64)
+            history = values[max(0, date + 1 - horizon) : date + 1]
             market_return = history.mean(axis=1)
             asset_variance = history.var(axis=0).mean()
             correlation_proxy = market_return.var() / max(asset_variance, 1e-12)
@@ -146,15 +149,18 @@ def _market_state(
                     float(np.clip(correlation_proxy, 0.0, 1.0)),
                 ]
             )
-        output[row, :, 6:21] = np.asarray(descriptors, dtype=np.float32)[None, :]
-    return output
+        daily[date, 6:21] = np.asarray(descriptors, dtype=np.float32)
+    windows = np.lib.stride_tricks.sliding_window_view(
+        daily, window_shape=window, axis=0
+    ).transpose(0, 2, 1)
+    return windows[indices - window].copy()
 
 
 def _state_with_expert_evidence(
     bundle: MarketDataBundle,
     indices: np.ndarray,
     window: int,
-    experts: np.ndarray,
+    expert_path: np.ndarray,
 ) -> np.ndarray:
     market = _market_state(bundle, indices, window)
     expert_history = np.empty(
@@ -162,15 +168,15 @@ def _state_with_expert_evidence(
     )
     for row, target in enumerate(indices):
         history = bundle.returns[int(target) - window : int(target)].astype(np.float64)
-        # How today's four feasible portfolios would have behaved over the
-        # observable trailing window.  No return at or after target is included.
-        expert_history[row] = np.einsum("wa,ka->wk", history, experts[row])
+        past_weights = expert_path[int(target) - window : int(target)]
+        # Realized returns of each causal expert rule at the corresponding
+        # historical date, rather than a hindsight portfolio held constant.
+        expert_history[row] = np.einsum("wa,wka->wk", history, past_weights)
     return np.concatenate([market, expert_history], axis=2).astype(np.float32)
 
 
 def _profile_cache(dataset: str, split: str, window: int, horizon: int) -> Path:
-    reset = "_annualreset" if split == "test" else ""
-    return CACHE_ROOT / f"{dataset}_{split}_w{window}_h{horizon}{reset}_v3.npz"
+    return CACHE_ROOT / f"{dataset}_{split}_w{window}_h{horizon}_paper.npz"
 
 
 def _expert_bank(
@@ -180,27 +186,51 @@ def _expert_bank(
     market: MarketWindowDataset,
 ) -> np.ndarray:
     path = _profile_cache(dataset, split, market.window, market.horizon)
+    data_hash = bundle_fingerprint(bundle)
+    code_hash = source_fingerprint()
     if path.exists():
-        payload = np.load(path, allow_pickle=False)
-        if np.array_equal(payload["indices"], market.indices):
-            return payload["experts"].astype(np.float32)
+        with np.load(path, allow_pickle=False) as payload:
+            if (
+                str(payload.get("data_sha256", "")) == data_hash
+                and str(payload.get("source_sha256", "")) == code_hash
+                and len(payload["experts"]) > int(market.indices[-1])
+            ):
+                return payload["experts"].astype(np.float32)
     values = [
-        profile_weights(bundle, market, split, expert_parameters(name))
+        generate_expert_weights(
+            bundle.returns,
+            np.arange(int(market.indices[-1]) + 1, dtype=np.int64),
+            expert_parameters(name),
+        )
         for name in EXPERT_NAMES
     ]
     experts = np.stack(values, axis=1).astype(np.float32)
     ensure_dir(path.parent)
-    np.savez_compressed(path, indices=market.indices, experts=experts)
+    np.savez_compressed(
+        path,
+        indices=market.indices,
+        experts=experts,
+        data_sha256=data_hash,
+        source_sha256=code_hash,
+    )
     return experts
 
 
 def _candidate_turnover(
-    bundle: MarketDataBundle, market: MarketWindowDataset, experts: np.ndarray
+    bundle: MarketDataBundle,
+    market: MarketWindowDataset,
+    experts: np.ndarray,
+    expert_path: np.ndarray | None = None,
 ) -> np.ndarray:
     n, k, assets = experts.shape
     output = np.empty((n, k), dtype=np.float64)
     previous = np.full((k, assets), 1.0 / assets, dtype=np.float64)
     previous_target: int | None = None
+    first = int(market.indices[0])
+    if expert_path is not None and first > 0:
+        previous = expert_path[first - 1].astype(np.float64)
+        drifted = previous * (1.0 + bundle.returns[first - 1][None, :])
+        previous = drifted / drifted.sum(axis=1, keepdims=True)
     for row, target_value in enumerate(market.indices):
         target = int(target_value)
         if previous_target is not None and target == previous_target + 1:
@@ -221,32 +251,33 @@ def _dynamic_utility(
     turnover: np.ndarray,
     parameters: TrainingParameters,
 ) -> np.ndarray:
+    """Compute Eq. (11) using the exact component definitions in B.3."""
     gross_path = future_path.astype(np.float64)
     turnover_path = turnover.astype(np.float64)
     if turnover_path.ndim == 2:
         turnover_path = turnover_path[:, None, :]
     if turnover_path.shape[1] not in (1, gross_path.shape[1]):
         raise ValueError("turnover must contain one value or one value per horizon day")
-    path = np.clip((1.0 + gross_path) * (1.0 - COST * turnover_path) - 1.0, -0.99, None)
-    log_growth = np.log1p(path).sum(axis=1)
-    downside = np.sqrt(np.square(np.minimum(path, 0.0)).mean(axis=1)) * np.sqrt(
-        path.shape[1]
-    )
-    wealth = np.cumprod(1.0 + path, axis=1)
+    if np.any(gross_path <= -1.0) or not np.isfinite(gross_path).all():
+        raise ValueError("gross expert returns must be finite and greater than -1")
+    # Transaction costs enter as c*T in Eq. (11), not inside G, D, or M.
+    wealth = np.cumprod(1.0 + gross_path, axis=1)
+    growth = wealth[:, -1] - 1.0
+    downside = np.sqrt(np.square(np.minimum(gross_path, 0.0)).mean(axis=1))
     peak = np.maximum.accumulate(
         np.concatenate([np.ones_like(wealth[:, :1]), wealth], axis=1), axis=1
     )[:, 1:]
     drawdown = np.max(1.0 - wealth / np.maximum(peak, 1e-12), axis=1)
-    assets = experts.shape[-1]
     hhi = np.square(experts.astype(np.float64)).sum(axis=-1)
     if hhi.ndim == 3:
         hhi = hhi.mean(axis=1)
-    concentration = np.clip((assets * hhi - 1.0) / max(assets - 1.0, 1.0), 0.0, 1.0)
+    total_turnover = np.broadcast_to(turnover_path, gross_path.shape).sum(axis=1)
     return (
-        log_growth
+        growth
         - parameters.downside_weight * downside
         - parameters.drawdown_weight * drawdown
-        - parameters.concentration_weight * concentration
+        - COST * total_turnover
+        - parameters.concentration_weight * hhi
     ).astype(np.float32)
 
 
@@ -260,29 +291,34 @@ def build_panel(
 ) -> RouterPanel:
     parameters = TrainingParameters() if parameters is None else parameters
     market = MarketWindowDataset(bundle, split, window, horizon)
+    if len(market) == 0:
+        raise ValueError(f"no split-contained windows available for {dataset}/{split}")
     # Candidate rules are recomputed on every future decision day.  This makes
     # the supervision match deployment, where the selected expert is a trading
     # rule whose feasible portfolio changes with the causal information set.
     daily_market = MarketWindowDataset(bundle, split, window, 1)
-    daily_experts = _expert_bank(bundle, dataset, split, daily_market)
+    expert_path = _expert_bank(bundle, dataset, split, daily_market)
+    daily_experts = expert_path[daily_market.indices]
     positions = np.searchsorted(daily_market.indices, market.indices)
     if not np.array_equal(daily_market.indices[positions], market.indices):
         raise RuntimeError("label dates are not aligned with the daily expert path")
     experts = daily_experts[positions]
-    daily_gross = np.einsum(
-        "na,nka->nk", bundle.returns[daily_market.indices], daily_experts
-    ).astype(np.float32)
-    gross_windows = np.lib.stride_tricks.sliding_window_view(
-        daily_gross, window_shape=horizon, axis=0
-    ).transpose(0, 2, 1)
-    future_path = gross_windows[positions].astype(np.float32)
     if split == "test":
-        # Test outcomes are carried only for the final portfolio simulator.
-        # They are deliberately not converted into supervision or labels.
+        # Test outcomes are read only by the portfolio simulator, never by targets.
+        future_path = np.empty((len(market), 0, len(EXPERT_NAMES)), dtype=np.float32)
         utility = np.zeros((len(market), len(EXPERT_NAMES)), dtype=np.float32)
         label = np.full(len(market), -1, dtype=np.int64)
     else:
-        daily_turnover = _candidate_turnover(bundle, daily_market, daily_experts)
+        daily_gross = np.einsum(
+            "na,nka->nk", bundle.returns[daily_market.indices], daily_experts
+        ).astype(np.float32)
+        gross_windows = np.lib.stride_tricks.sliding_window_view(
+            daily_gross, window_shape=horizon, axis=0
+        ).transpose(0, 2, 1)
+        future_path = gross_windows[positions].astype(np.float32)
+        daily_turnover = _candidate_turnover(
+            bundle, daily_market, daily_experts, expert_path
+        )
         turnover_windows = np.lib.stride_tricks.sliding_window_view(
             daily_turnover, window_shape=horizon, axis=0
         ).transpose(0, 2, 1)
@@ -300,7 +336,7 @@ def build_panel(
         dataset=dataset,
         split=split,
         market=market,
-        state=_state_with_expert_evidence(bundle, market.indices, window, experts),
+        state=_state_with_expert_evidence(bundle, market.indices, window, expert_path),
         experts=experts,
         future_path=future_path,
         utility=utility,
@@ -329,22 +365,16 @@ def _loss(
     logits, gate = model(batch["state"].to(device))
     target = batch["label"].to(device)
     utility = batch["utility"].to(device)
-    classification = nn.functional.cross_entropy(logits, target, label_smoothing=0.02)
     soft_target = torch.softmax(utility / parameters.utility_temperature, dim=1)
-    distribution = nn.functional.kl_div(
-        nn.functional.log_softmax(logits, dim=1), soft_target, reduction="batchmean"
+    cross_entropy = (
+        -(soft_target * nn.functional.log_softmax(logits, dim=1)).sum(dim=1).mean()
     )
     regret = (utility.max(dim=1).values - (gate * utility).sum(dim=1)).mean()
-    total = (
-        (1.0 - parameters.soft_target_weight) * classification
-        + parameters.soft_target_weight * distribution
-        + parameters.utility_weight * regret
-    )
+    total = cross_entropy + parameters.utility_weight * regret
     accuracy = (logits.argmax(dim=1) == target).float().mean()
     return total, {
         "loss": float(total.detach()),
-        "classification": float(classification.detach()),
-        "distribution": float(distribution.detach()),
+        "cross_entropy": float(cross_entropy.detach()),
         "utility_regret": float(regret.detach()),
         "accuracy": float(accuracy.detach()),
     }
@@ -367,30 +397,6 @@ def predict_probability(
     return np.concatenate(values)
 
 
-def hard_gate(probability: np.ndarray, switching_margin: float = 0.0) -> np.ndarray:
-    log_probability = np.log(np.clip(probability, 1e-12, 1.0))
-    choice = np.empty(len(probability), dtype=np.int64)
-    choice[0] = int(log_probability[0].argmax())
-    for row in range(1, len(probability)):
-        candidate = int(log_probability[row].argmax())
-        previous = int(choice[row - 1])
-        if (
-            candidate != previous
-            and (log_probability[row, candidate] - log_probability[row, previous])
-            < switching_margin
-        ):
-            candidate = previous
-        choice[row] = candidate
-    return np.eye(probability.shape[1], dtype=np.float32)[choice]
-
-
-def dynamic_label_gate(panel: RouterPanel) -> np.ndarray:
-    """Return the auditable per-date best-expert labels inside labelled splits."""
-    if np.any(panel.label < 0):
-        raise ValueError("dynamic labels are unavailable for the test split")
-    return np.eye(len(EXPERT_NAMES), dtype=np.float32)[panel.label]
-
-
 def _metrics(panel: RouterPanel, gate: np.ndarray):
     weights = np.einsum("ne,nea->na", gate.astype(np.float64), panel.experts)
     net, wealth, turnover = simulate_portfolio(weights, panel.market.next_returns, COST)
@@ -405,67 +411,17 @@ def _portfolio_score(metrics: dict[str, float]) -> float:
     )
 
 
-def _calibrate_switching_margin(
-    model: DynamicExpertRouter,
-    validation: list[RouterPanel],
-    device: torch.device,
-    batch_size: int,
-) -> tuple[float, dict]:
-    probabilities = [
-        predict_probability(model, panel.state, device, batch_size)
-        for panel in validation
-    ]
-    best = None
-    rows = []
-    for margin in (0.0, 0.02, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.00, 1.50):
-        scores = []
-        switch_rates = []
-        for panel, probability in zip(validation, probabilities):
-            gate = hard_gate(probability, margin)
-            scores.append(_portfolio_score(_metrics(panel, gate)[0]))
-            choice = gate.argmax(axis=1)
-            switch_rates.append(float(np.mean(choice[1:] != choice[:-1])))
-        candidate = (float(np.mean(scores)), -float(np.mean(switch_rates)), -margin)
-        rows.append(
-            {
-                "margin": margin,
-                "mean_portfolio_score": candidate[0],
-                "mean_switch_rate": -candidate[1],
-            }
-        )
-        if best is None or candidate > best[0]:
-            best = (candidate, margin)
-    assert best is not None
-    return float(best[1]), {"grid": rows, "selected_margin": float(best[1])}
-
-
-def _save_result(
-    panel: RouterPanel,
-    gate: np.ndarray,
-    method: str,
-    output: Path,
-    bundle: MarketDataBundle,
-) -> dict:
-    metrics, weights, net, wealth, turnover = _metrics(panel, gate)
-    target = ensure_dir(
-        output / panel.dataset / method.replace(" ", "_").replace("/", "_")
-    )
-    save_backtest_tables(
-        panel.market.dates, weights, net, wealth, bundle.tickers, target
-    )
-    pd.DataFrame(
-        {"date": pd.to_datetime(panel.market.dates), "turnover": turnover}
-    ).to_csv(target / "turnover.csv", index=False)
-    result = {
-        **metrics,
-        "dataset": panel.dataset,
-        "method": method,
-        "maximum_weight": float(weights.max()),
-        "simplex_max_error": float(np.abs(weights.sum(axis=1) - 1.0).max()),
-        "evidence_status": "retrospective_current_panel_development",
-    }
-    save_json(result, target / "metrics.json")
-    return result
+def _reference_expert(panel: RouterPanel) -> int:
+    """Select Eq. (14)'s reference over the complete training period."""
+    if panel.split != "train":
+        raise ValueError("the reference expert must be selected on training data")
+    scores = []
+    for expert in range(len(EXPERT_NAMES)):
+        gate = np.eye(len(EXPERT_NAMES), dtype=np.float32)[
+            np.full(len(panel.market), expert, dtype=np.int64)
+        ]
+        scores.append(_portfolio_score(_metrics(panel, gate)[0]))
+    return int(np.argmax(scores))
 
 
 def _label_audit(panel: RouterPanel) -> dict:
@@ -488,7 +444,6 @@ def run(
     seed: int,
     parameters: TrainingParameters,
     device_name: str,
-    evaluate_test: bool = True,
     datasets: tuple[str, ...] = DATASETS,
     data_dir: str | Path = "data",
 ) -> pd.DataFrame:
@@ -534,15 +489,8 @@ def run(
         build_panel(bundles[name], name, "val", parameters.window, 1, parameters)
         for name in datasets
     ]
-    test = (
-        [
-            build_panel(bundles[name], name, "test", parameters.window, 1, parameters)
-            for name in datasets
-        ]
-        if evaluate_test
-        else []
-    )
-    mean, std = _standardize(train, validation_labels, validation, test)
+    mean, std = _standardize(train, validation_labels, validation)
+    references = {panel.dataset: _reference_expert(panel) for panel in train}
     dataset = JointRouterDataset(train)
     loader = DataLoader(
         dataset,
@@ -585,7 +533,11 @@ def run(
                 model, panel.state, device, parameters.batch_size
             )
             validation_scores.append(
-                _portfolio_score(_metrics(panel, hard_gate(probability))[0])
+                _portfolio_score(
+                    _metrics(
+                        panel, member_gate(probability, 0.0, references[panel.dataset])
+                    )[0]
+                )
             )
         correct = total = 0
         for panel in validation_labels:
@@ -620,9 +572,6 @@ def run(
             best_state = copy.deepcopy(model.state_dict())
     model.load_state_dict(best_state)
     output = ensure_dir(ROOT / f"seed{seed}")
-    switching_margin, calibration = _calibrate_switching_margin(
-        model, validation, device, parameters.batch_size
-    )
     label_audit = [_label_audit(panel) for panel in train + validation_labels]
     save_json(
         {
@@ -630,82 +579,33 @@ def run(
                 "argmax risk-adjusted utility of the daily recomputed expert rule "
                 f"over the next {parameters.label_horizon} split-contained observations"
             ),
-            "label_deployment_alignment": "daily expert-rule path with daily transaction costs",
-            "fixed_market_labels": False,
+            "implementation_id": IMPLEMENTATION_ID,
+            "score_definition": "Eq11; components Eqs20-26; raw scores without date-wise standardization",
             "expert_order": list(EXPERT_NAMES),
             "label_audit": label_audit,
         },
         output / "dynamic_label_audit.json",
     )
-    save_json(calibration, output / "validation_calibration.json")
     torch.save(
         {
             "state_dict": model.state_dict(),
             "seed": seed,
             "best_epoch": best_epoch,
             "parameters": asdict(parameters),
+            "implementation_id": IMPLEMENTATION_ID,
+            "source_sha256": source_fingerprint(),
+            "datasets": list(datasets),
+            "data_sha256": {
+                name: bundle_fingerprint(bundle) for name, bundle in bundles.items()
+            },
             "expert_order": EXPERT_NAMES,
             "state_mean": mean,
             "state_std": std,
-            "switching_margin": switching_margin,
+            "reference_experts": references,
         },
         output / "router.pt",
     )
     save_json({"history": history}, output / "training_history.json")
-    if not evaluate_test:
-        elapsed = float(time.perf_counter() - started_at)
-        save_json(
-            {
-                "seed": seed,
-                "device": str(device),
-                "elapsed_seconds": elapsed,
-                "epochs_requested": parameters.epochs,
-                "best_epoch": best_epoch,
-                "best_validation_portfolio_score": float(best_key[0]),
-                "best_validation_dynamic_label_accuracy": float(best_key[1]),
-                "test_evaluated": False,
-            },
-            output / "runtime.json",
-        )
-        return pd.DataFrame(
-            [
-                {
-                    "dataset": "validation",
-                    "method": METHOD,
-                    "seed": seed,
-                    "best_epoch": best_epoch,
-                    "validation_portfolio_score": float(best_key[0]),
-                    "validation_dynamic_label_accuracy": float(best_key[1]),
-                }
-            ]
-        )
-    rows = []
-    routes = []
-    for panel in test:
-        probability = predict_probability(
-            model, panel.state, device, parameters.batch_size
-        )
-        dynamic_gate = hard_gate(probability, switching_margin)
-        result = _save_result(
-            panel, dynamic_gate, METHOD, output, bundles[panel.dataset]
-        )
-        result.update({"seed": seed, "best_epoch": best_epoch})
-        rows.append(result)
-        choice = dynamic_gate.argmax(axis=1)
-        for index, date in enumerate(panel.market.dates):
-            routes.append(
-                {
-                    "dataset": panel.dataset,
-                    "date": date,
-                    "selected_expert": EXPERT_NAMES[int(choice[index])],
-                    "switch": bool(index > 0 and choice[index] != choice[index - 1]),
-                    **{
-                        f"p_{name}": float(probability[index, k])
-                        for k, name in enumerate(EXPERT_NAMES)
-                    },
-                }
-            )
-    frame = pd.DataFrame(rows)
     elapsed = float(time.perf_counter() - started_at)
     save_json(
         {
@@ -714,12 +614,26 @@ def run(
             "elapsed_seconds": elapsed,
             "epochs_requested": parameters.epochs,
             "best_epoch": best_epoch,
+            "implementation_id": IMPLEMENTATION_ID,
+            "test_evaluated": False,
+            "best_validation_portfolio_score": float(best_key[0]),
+            "best_validation_dynamic_label_accuracy": float(best_key[1]),
         },
         output / "runtime.json",
     )
-    frame.to_csv(output / "metrics.csv", index=False)
-    pd.DataFrame(routes).to_csv(output / "routing_probabilities.csv", index=False)
-    return frame
+    return pd.DataFrame(
+        [
+            {
+                "dataset": "validation",
+                "method": METHOD,
+                "seed": seed,
+                "best_epoch": best_epoch,
+                "validation_portfolio_score": float(best_key[0]),
+                "validation_dynamic_label_accuracy": float(best_key[1]),
+                "implementation_id": IMPLEMENTATION_ID,
+            }
+        ]
+    )
 
 
 def main() -> None:
@@ -744,11 +658,6 @@ def main() -> None:
         "--utility-weight", type=float, default=TrainingParameters.utility_weight
     )
     parser.add_argument(
-        "--soft-target-weight",
-        type=float,
-        default=TrainingParameters.soft_target_weight,
-    )
-    parser.add_argument(
         "--utility-temperature",
         type=float,
         default=TrainingParameters.utility_temperature,
@@ -760,12 +669,8 @@ def main() -> None:
         "--datasets",
         nargs="+",
         default=list(DATASETS),
-        help="research panel names, or 'synthetic' for an offline smoke run",
-    )
-    parser.add_argument(
-        "--validation-only",
-        action="store_true",
-        help="train and select checkpoints without constructing or evaluating the test split",
+        choices=DATASETS,
+        help="research panels used jointly for training",
     )
     args = parser.parse_args()
     ROOT = Path(args.output_root)
@@ -783,11 +688,9 @@ def main() -> None:
                 feedforward=args.feedforward,
                 batch_size=args.batch_size,
                 utility_weight=args.utility_weight,
-                soft_target_weight=args.soft_target_weight,
                 utility_temperature=args.utility_temperature,
             ),
             args.device,
-            evaluate_test=not args.validation_only,
             datasets=datasets,
             data_dir=args.data_dir,
         )

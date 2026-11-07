@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 import numpy as np
+from scipy.optimize import minimize
 
 from .data import MarketDataBundle, MarketWindowDataset
 
@@ -30,18 +31,15 @@ class DenseExpert:
     rebalance: int = 5
     risk_aversion: float = 8.0
     diagonal_shrinkage: float = 0.50
-    mean_scale: float = 1.0
-    iterations: int = 15
+    iterations: int = 200
 
     def validate(self) -> None:
         if self.lookback < 20 or self.rebalance < 1 or self.iterations < 1:
             raise ValueError(
                 "invalid dense lookback, rebalance interval, or iterations"
             )
-        if self.risk_aversion <= 0.0 or self.mean_scale < 0.0:
-            raise ValueError(
-                "risk_aversion must be positive and mean_scale non-negative"
-            )
+        if self.risk_aversion <= 0.0:
+            raise ValueError("risk_aversion must be positive")
         if not 0.0 <= self.diagonal_shrinkage <= 1.0:
             raise ValueError("diagonal_shrinkage must lie in [0, 1]")
 
@@ -77,7 +75,6 @@ def expert_parameters(name: str) -> ExpertParameters:
                 rebalance=10,
                 risk_aversion=32.0,
                 diagonal_shrinkage=0.75,
-                mean_scale=0.50,
             ),
             sparse_weight=0.0,
         ),
@@ -91,7 +88,6 @@ def expert_parameters(name: str) -> ExpertParameters:
                 rebalance=5,
                 risk_aversion=8.0,
                 diagonal_shrinkage=0.0,
-                mean_scale=1.0,
             ),
             sparse_weight=0.0,
         ),
@@ -147,31 +143,39 @@ def capped_simplex_projection(
 def _drift(weight: np.ndarray, realized: np.ndarray) -> np.ndarray:
     value = weight * (1.0 + realized)
     total = float(value.sum())
-    return value / total if total > 1e-12 else weight.copy()
+    if not np.isfinite(total) or total <= 0.0:
+        raise ValueError("portfolio value must remain positive during drift")
+    return value / total
 
 
 def _repair(weight: np.ndarray, cap: float) -> np.ndarray:
-    value = np.nan_to_num(
-        np.asarray(weight, dtype=np.float64), nan=0.0, posinf=0.0, neginf=0.0
-    )
+    value = np.asarray(weight, dtype=np.float64)
+    if value.ndim != 1 or len(value) == 0:
+        raise ValueError("portfolio weights must be a non-empty vector")
+    if not np.isfinite(value).all():
+        raise ValueError("portfolio weights must be finite")
+    if float(value.min()) < -1e-10:
+        raise ValueError("portfolio weights must be non-negative")
     value = np.maximum(value, 0.0)
-    if float(value.sum()) <= 1e-12:
-        value = np.ones_like(value)
-    value /= value.sum()
+    total = float(value.sum())
+    if total <= 1e-12:
+        raise ValueError("portfolio weights must have a positive sum")
+    value /= total
     return capped_simplex_projection(value, cap, iterations=25)
 
 
 def _sparse_target(
     history: np.ndarray, parameters: SparseExpert, cap: float
 ) -> np.ndarray:
+    """Implement the Eq. (6) preference followed by the Eq. (7) projection."""
     cumulative = np.prod(1.0 + history, axis=0) - 1.0
-    volatility = np.clip(history.std(axis=0, ddof=1), 1e-4, None)
-    score = cumulative / volatility if parameters.risk_normalize else cumulative
+    inverse_risk = 1.0 / (history.std(axis=0, ddof=1) + 1e-8)
+    score = cumulative * inverse_risk if parameters.risk_normalize else cumulative
     count = max(1, int(np.ceil(parameters.top_fraction * history.shape[1])))
     selected = np.argsort(score, kind="mergesort")[-count:]
-    raw = np.zeros(history.shape[1], dtype=np.float64)
-    raw[selected] = 1.0 / volatility[selected]
-    return _repair(raw, cap)
+    preference = np.zeros(history.shape[1], dtype=np.float64)
+    preference[selected] = inverse_risk[selected]
+    return capped_simplex_projection(preference, cap)
 
 
 def _dense_target(
@@ -180,21 +184,60 @@ def _dense_target(
     parameters: DenseExpert,
     cap: float,
 ) -> np.ndarray:
+    """Numerically solve the convex capped-simplex program in Eq. (8).
+
+    SLSQP is supplied with the analytic gradient and the exact equality/bound
+    constraints.  Failure is reported explicitly rather than replaced by a
+    different portfolio construction rule.
+    """
     mean = history.mean(axis=0)
-    covariance = np.cov(history, rowvar=False)
+    covariance = np.atleast_2d(np.cov(history, rowvar=False))
     diagonal = np.diag(np.diag(covariance))
     shrinkage = parameters.diagonal_shrinkage
     covariance = (1.0 - shrinkage) * covariance + shrinkage * diagonal
-    scale = max(float(np.linalg.norm(covariance, ord=np.inf)), 1e-12)
-    step = min(1.0 / (2.0 * parameters.risk_aversion * scale), 100.0)
-    weight = previous.copy()
-    for _ in range(parameters.iterations):
-        gradient = (
-            -parameters.mean_scale * mean
-            + 2.0 * parameters.risk_aversion * covariance @ weight
+    covariance = 0.5 * (covariance + covariance.T)
+    initial = _repair(previous, cap)
+
+    def objective(weight: np.ndarray) -> float:
+        return float(
+            -mean @ weight + parameters.risk_aversion * weight @ covariance @ weight
         )
-        weight = capped_simplex_projection(weight - step * gradient, cap, iterations=15)
-    return _repair(weight, cap)
+
+    def gradient(weight: np.ndarray) -> np.ndarray:
+        return -mean + 2.0 * parameters.risk_aversion * covariance @ weight
+
+    result = minimize(
+        objective,
+        initial,
+        method="SLSQP",
+        jac=gradient,
+        bounds=[(0.0, cap)] * len(initial),
+        constraints={
+            "type": "eq",
+            "fun": lambda weight: float(weight.sum() - 1.0),
+            "jac": lambda weight: np.ones_like(weight),
+        },
+        options={
+            "maxiter": parameters.iterations,
+            "ftol": 1e-12,
+            "disp": False,
+        },
+    )
+    if not result.success:
+        raise RuntimeError(
+            "dense expert Eq. (8) optimization failed: "
+            f"status={result.status}, message={result.message}"
+        )
+    weight = np.asarray(result.x, dtype=np.float64)
+    feasible = (
+        np.isfinite(weight).all()
+        and abs(float(weight.sum()) - 1.0) <= 1e-8
+        and float(weight.min()) >= -1e-10
+        and float(weight.max()) <= cap + 1e-10
+    )
+    if not feasible:
+        raise RuntimeError("dense expert Eq. (8) solver returned an infeasible point")
+    return weight
 
 
 def generate_expert_weights(
@@ -213,8 +256,8 @@ def generate_expert_weights(
         or np.any(np.diff(indices) <= 0)
     ):
         raise ValueError("target indices must be strictly increasing and in range")
-    if not np.isfinite(returns).all():
-        raise ValueError("returns must be finite")
+    if not np.isfinite(returns).all() or np.any(returns <= -1.0):
+        raise ValueError("returns must be finite and greater than -1")
     assets = returns.shape[1]
     parameters.validate(assets)
     cap = min(1.0, parameters.cap_multiple / float(assets))
@@ -223,7 +266,7 @@ def generate_expert_weights(
     output = np.empty((len(indices), assets), dtype=np.float64)
     for row, target in enumerate(indices):
         if row % parameters.sparse.rebalance == 0:
-            end = int(target) - parameters.sparse.skip
+            end = max(0, int(target) - parameters.sparse.skip)
             history = returns[max(0, end - parameters.sparse.lookback) : end]
             if len(history) >= 20:
                 sparse = _sparse_target(history, parameters.sparse, cap)
@@ -251,15 +294,14 @@ def profile_weights(
     split: str,
     parameters: ExpertParameters,
 ) -> np.ndarray:
-    """Generate an expert path, resetting each test calendar year."""
-    if split != "test":
-        return generate_expert_weights(bundle.returns, market.indices, parameters)
-    dates = bundle.dates[market.indices]
-    years = dates.astype("datetime64[Y]")
-    output = np.empty((len(market), bundle.num_assets), dtype=np.float64)
-    for year in np.unique(years):
-        keep = years == year
-        output[keep] = generate_expert_weights(
-            bundle.returns, market.indices[keep], parameters
-        )
-    return output
+    """Return a split slice from one causal expert path rooted at data start.
+
+    Train, validation, and test therefore share identical state and rebalance
+    phase at every overlapping date.  ``split`` remains in the public API for
+    callers and cache keys, but does not alter expert dynamics.
+    """
+    del split
+    last_target = int(market.indices[-1])
+    full_indices = np.arange(last_target + 1, dtype=np.int64)
+    full_path = generate_expert_weights(bundle.returns, full_indices, parameters)
+    return full_path[market.indices]

@@ -14,29 +14,51 @@ import torch
 from . import experiment as experiment_module
 from .config import DEFAULT_DATASETS, dataset_configuration
 from .data import load_market_data
-from .experiment import (COST, EXPERT_NAMES, TrainingParameters,
-                         _portfolio_score, build_panel, hard_gate)
+from .experiment import (
+    COST,
+    EXPERT_NAMES,
+    TrainingParameters,
+    _portfolio_score,
+    build_panel,
+)
 from .model import DynamicExpertRouter
-from .portfolio import (backtest_metrics, ensure_dir, save_backtest_tables,
-                        save_json, simulate_portfolio)
+from .portfolio import (
+    backtest_metrics,
+    ensure_dir,
+    save_backtest_tables,
+    save_json,
+    simulate_portfolio,
+)
+from .protocol import IMPLEMENTATION_ID, bundle_fingerprint, source_fingerprint
+from .routing import (
+    ADAPTIVE_SHARES,
+    CONFIDENCE_THRESHOLDS,
+    blend_reference,
+    confidence_votes,
+    majority_gate,
+)
 
 METHOD = "AlphaRouter"
 SEEDS = (101, 202, 303, 404, 505)
-BASE_ROOT = Path("outputs/alpharouter_members")
-ROOT = Path("outputs/alpharouter_committee")
-PRIOR_LOOKBACK = 756
+BASE_ROOT = Path("outputs/alpharouter_members_paper")
+ROOT = Path("outputs/alpharouter_committee_paper")
 
 
 def _load_member(
     seed: int, device: torch.device
 ) -> tuple[DynamicExpertRouter, dict[str, Any], dict[str, Any]]:
     folder = BASE_ROOT / f"seed{seed}"
+    payload = torch.load(folder / "router.pt", map_location=device, weights_only=False)
+    if payload.get("implementation_id") != IMPLEMENTATION_ID:
+        raise RuntimeError(
+            "checkpoint uses a different protocol; retrain under the paper equations"
+        )
+    if payload.get("source_sha256") != source_fingerprint():
+        raise RuntimeError(
+            "checkpoint source fingerprint differs from the current implementation"
+        )
     with (folder / "dynamic_label_audit.json").open(encoding="utf-8") as stream:
         audit = json.load(stream)
-    if audit.get("fixed_market_labels") is not False:
-        raise RuntimeError("refusing a checkpoint not trained with dynamic labels")
-
-    payload = torch.load(folder / "router.pt", map_location=device, weights_only=False)
     if tuple(payload.get("expert_order", ())) != EXPERT_NAMES:
         raise RuntimeError(f"checkpoint seed {seed} uses an incompatible expert order")
     parameters = payload["parameters"]
@@ -78,70 +100,28 @@ def _probabilities(
     return np.stack(result)
 
 
-def _hard_consensus(
-    member_probability: np.ndarray,
-    margin: float,
-    prior: np.ndarray,
-) -> np.ndarray:
-    """Route only when every independently trained member agrees."""
-    member_gate = np.stack(
-        [hard_gate(probability, margin) for probability in member_probability]
-    )
-    votes = member_gate.sum(axis=0)
-    candidate = votes.argmax(axis=1)
-    unanimous = votes.max(axis=1) == member_probability.shape[0]
-    choice = np.where(unanimous, candidate, int(prior.argmax()))
-    return np.eye(votes.shape[1], dtype=np.float32)[choice]
-
-
 def _training_prior(
-    panel: Any, lookback: int = PRIOR_LOOKBACK
+    panel: Any,
 ) -> tuple[np.ndarray, dict]:
-    """Select the long-horizon expert using training observations only."""
-    length = min(int(lookback), len(panel.market.next_returns))
+    """Select Eq. (14)'s reference using all training observations."""
+    if panel.split != "train":
+        raise ValueError("the reference expert must be selected on the training split")
+    length = len(panel.market.next_returns)
     scores = []
     for expert in range(len(EXPERT_NAMES)):
         gate = np.eye(len(EXPERT_NAMES), dtype=np.float32)[
             np.full(length, expert, dtype=np.int64)
         ]
-        local = type(
-            "PriorPanel",
-            (),
-            {
-                "experts": panel.experts[-length:],
-                "market": type(
-                    "PriorMarket",
-                    (),
-                    {"next_returns": panel.market.next_returns[-length:]},
-                )(),
-            },
-        )()
-        scores.append(float(_portfolio_score(_metrics(local, gate)[0])))
+        scores.append(float(_portfolio_score(_metrics(panel, gate)[0])))
     selected = int(np.argmax(scores))
     prior = np.eye(len(EXPERT_NAMES), dtype=np.float32)[selected]
     audit = {
-        "lookback_observations": int(length),
+        "training_observations": int(length),
         "score_definition": "ASR + 0.25 CR + 0.10 APY",
         "scores": {name: value for name, value in zip(EXPERT_NAMES, scores)},
         "selected_expert": EXPERT_NAMES[selected],
     }
     return prior, audit
-
-
-def _residual_gate(
-    prior: np.ndarray,
-    dynamic_gate: np.ndarray,
-    adaptive_share: float,
-) -> np.ndarray:
-    """Allocate a fixed sleeve to the daily route while preserving feasibility."""
-    share = float(adaptive_share)
-    if not 0.0 <= share <= 1.0:
-        raise ValueError("adaptive_share must lie in [0, 1]")
-    prior_gate = np.broadcast_to(prior, dynamic_gate.shape).astype(np.float32)
-    gate = (1.0 - share) * prior_gate + share * dynamic_gate.astype(np.float32)
-    if not np.allclose(gate.sum(axis=1), 1.0, atol=1e-6) or np.any(gate < 0.0):
-        raise RuntimeError("residual routing produced an infeasible expert gate")
-    return gate
 
 
 def _metrics(panel: Any, gate: np.ndarray) -> tuple:
@@ -164,20 +144,24 @@ def _calibrate(
     rows = []
     per_market: dict[str, tuple[tuple[float, ...], float, float]] = {}
     best: tuple[tuple[float, ...], float, float] | None = None
-    adaptive_shares = (0.0, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200)
-    margins = (0.0, 0.05, 0.10, 0.20, 0.35, 0.50, 0.75, 1.0, 1.5)
-    for margin in margins:
-        for adaptive_share in adaptive_shares:
+    for margin in CONFIDENCE_THRESHOLDS:
+        for adaptive_share in ADAPTIVE_SHARES:
             scores = []
             switches = []
             for panel in validation:
-                dynamic = _hard_consensus(
-                    probabilities[panel.dataset], margin, priors[panel.dataset]
+                dynamic = majority_gate(
+                    probabilities[panel.dataset],
+                    margin,
+                    int(priors[panel.dataset].argmax()),
                 )
-                gate = _residual_gate(priors[panel.dataset], dynamic, adaptive_share)
+                gate = blend_reference(priors[panel.dataset], dynamic, adaptive_share)
                 score = float(_portfolio_score(_metrics(panel, gate)[0]))
                 choice = dynamic.argmax(axis=1)
-                switch_rate = float(np.mean(choice[1:] != choice[:-1]))
+                switch_rate = (
+                    float(np.mean(choice[1:] != choice[:-1]))
+                    if len(choice) > 1
+                    else 0.0
+                )
                 scores.append(score)
                 switches.append(switch_rate)
                 market_key = (score, -switch_rate, -adaptive_share, -margin)
@@ -196,7 +180,7 @@ def _calibrate(
             )
             rows.append(
                 {
-                    "margin": margin,
+                    "confidence_threshold": margin,
                     "adaptive_share": adaptive_share,
                     "mean_validation_score": key[0],
                     "router_switch_rate": -key[1],
@@ -207,11 +191,14 @@ def _calibrate(
     if best is None:
         raise RuntimeError("calibration grid is empty")
     selected = {
-        dataset: {"margin": float(value[1]), "adaptive_share": float(value[2])}
+        dataset: {
+            "confidence_threshold": float(value[1]),
+            "adaptive_share": float(value[2]),
+        }
         for dataset, value in per_market.items()
     }
     global_selection = {
-        "margin": float(best[1]),
+        "confidence_threshold": float(best[1]),
         "adaptive_share": float(best[2]),
     }
     return selected, global_selection, rows
@@ -233,6 +220,7 @@ def _save_result(panel: Any, gate: np.ndarray, output: Path, bundle: Any) -> dic
         "maximum_weight": float(weights.max()),
         "simplex_max_error": float(np.abs(weights.sum(axis=1) - 1.0).max()),
         "evidence_status": "retrospective_development",
+        "implementation_id": IMPLEMENTATION_ID,
     }
     save_json(result, target / "metrics.json")
     return result
@@ -244,10 +232,12 @@ def run(
     batch_size: int,
     datasets: tuple[str, ...] = DEFAULT_DATASETS,
     data_dir: str | Path = "data",
-    cache_root: str | Path = "outputs/cache",
+    cache_root: str | Path = "outputs/cache_paper",
 ) -> pd.DataFrame:
     if not seeds:
         raise ValueError("at least one member seed is required")
+    if len(set(seeds)) != len(seeds):
+        raise ValueError("committee seeds must be distinct")
     if batch_size < 1 or not datasets:
         raise ValueError("batch_size and datasets must be non-empty")
     device = torch.device(
@@ -269,16 +259,21 @@ def run(
         name: load_market_data(dataset_configuration(name, data_dir))
         for name in datasets
     }
+    data_hashes = {name: bundle_fingerprint(bundle) for name, bundle in bundles.items()}
+    for _, payload, _ in members:
+        if (
+            payload.get("datasets") != list(datasets)
+            or payload.get("data_sha256") != data_hashes
+        ):
+            raise RuntimeError(
+                "checkpoint training datasets or data fingerprints do not match"
+            )
     training = [
         build_panel(bundles[name], name, "train", parameters.window, 1, parameters)
         for name in datasets
     ]
     validation = [
         build_panel(bundles[name], name, "val", parameters.window, 1, parameters)
-        for name in datasets
-    ]
-    test = [
-        build_panel(bundles[name], name, "test", parameters.window, 1, parameters)
         for name in datasets
     ]
     prior_payload = {panel.dataset: _training_prior(panel) for panel in training}
@@ -293,26 +288,35 @@ def run(
         {
             "method": METHOD,
             "member_seeds": list(seeds),
-            "fixed_market_labels": False,
+            "implementation_id": IMPLEMENTATION_ID,
+            "source_sha256": source_fingerprint(),
+            "data_sha256": data_hashes,
             "shared_experts": list(EXPERT_NAMES),
             "per_market_validation_calibration": calibration,
             "global_validation_calibration": global_calibration,
-            "adaptive_share_search_range": [0.0, 0.20],
+            "confidence_threshold_grid": list(CONFIDENCE_THRESHOLDS),
+            "adaptive_share_grid": list(ADAPTIVE_SHARES),
             "train_only_expert_prior": prior_audit,
             "validation_grid": grid,
         },
         output / "committee_calibration.json",
     )
 
+    # All train/validation choices are written before the final split is built.
+    test = [
+        build_panel(bundles[name], name, "test", parameters.window, 1, parameters)
+        for name in datasets
+    ]
     rows = []
     routes = []
     for panel in test:
         selection = calibration[panel.dataset]
         probability = _probabilities(members, panel.state, device, batch_size)
-        consensus = _hard_consensus(
-            probability, selection["margin"], priors[panel.dataset]
+        reference = int(priors[panel.dataset].argmax())
+        consensus = majority_gate(
+            probability, selection["confidence_threshold"], reference
         )
-        gate = _residual_gate(
+        gate = blend_reference(
             priors[panel.dataset], consensus, selection["adaptive_share"]
         )
         row = _save_result(panel, gate, output, bundles[panel.dataset])
@@ -320,13 +324,15 @@ def run(
             {
                 "member_seeds": " ".join(map(str, seeds)),
                 "adaptive_share": selection["adaptive_share"],
-                "switching_margin": selection["margin"],
+                "confidence_threshold": selection["confidence_threshold"],
                 "prior_expert": prior_audit[panel.dataset]["selected_expert"],
             }
         )
         rows.append(row)
         choice = consensus.argmax(axis=1)
-        votes = probability.argmax(axis=2)
+        votes = confidence_votes(
+            probability, selection["confidence_threshold"], reference
+        )
         for index, date in enumerate(panel.market.dates):
             routes.append(
                 {
@@ -356,13 +362,14 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--base-root", default=str(BASE_ROOT))
     parser.add_argument("--output-root", default=str(ROOT))
-    parser.add_argument("--cache-root", default="outputs/cache")
+    parser.add_argument("--cache-root", default="outputs/cache_paper")
     parser.add_argument("--data-dir", default="data")
     parser.add_argument(
         "--datasets",
         nargs="+",
         default=list(DEFAULT_DATASETS),
-        help="research panel names, or 'synthetic' for an offline smoke run",
+        choices=DEFAULT_DATASETS,
+        help="the same research panels used to train the committee members",
     )
     args = parser.parse_args()
     BASE_ROOT = Path(args.base_root)

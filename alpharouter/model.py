@@ -9,8 +9,8 @@ from torch import nn
 class DynamicExpertRouter(nn.Module):
     """Map a causal market history to a hard decision over shared experts.
 
-    The router predicts four logits rather than asset weights.  Every downstream
-    portfolio is therefore one of the feasible long-only expert portfolios.
+    The router predicts four expert logits. The deployment gate then blends
+    the selected expert with the reference under Eq. (18).
     """
 
     def __init__(

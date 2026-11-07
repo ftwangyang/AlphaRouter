@@ -35,24 +35,43 @@ def simulate_portfolio(
     """Simulate daily rebalancing with multiplicative proportional costs."""
     weights = np.asarray(weights, dtype=np.float64)
     asset_returns = np.asarray(asset_returns, dtype=np.float64)
+    if weights.ndim != 2 or weights.shape[0] == 0 or weights.shape[1] == 0:
+        raise ValueError("weights must be a non-empty [dates, assets] matrix")
     if weights.shape != asset_returns.shape:
         raise ValueError(
             f"weights {weights.shape} and returns {asset_returns.shape} must match"
         )
+    if not np.isfinite(weights).all() or np.any(weights < -1e-7):
+        raise ValueError("weights must be finite and long-only")
+    if not np.allclose(weights.sum(axis=1), 1.0, atol=1e-6):
+        raise ValueError("weights must be fully invested")
+    if not np.isfinite(asset_returns).all() or np.any(asset_returns <= -1.0):
+        raise ValueError("asset returns must be finite and greater than -1")
+    if not np.isfinite(transaction_cost) or transaction_cost < 0.0:
+        raise ValueError("transaction_cost must be finite and non-negative")
     if initial_weights is None:
         initial_weights = np.full(weights.shape[1], 1.0 / weights.shape[1])
     previous = np.asarray(initial_weights, dtype=np.float64)
+    if (
+        previous.shape != (weights.shape[1],)
+        or not np.isfinite(previous).all()
+        or np.any(previous < 0.0)
+        or not np.isclose(previous.sum(), 1.0)
+    ):
+        raise ValueError("initial_weights must be a feasible portfolio")
     net_returns = np.empty(weights.shape[0], dtype=np.float64)
     turnovers = np.empty_like(net_returns)
     for index, (weight, next_return) in enumerate(zip(weights, asset_returns)):
         turnover = np.abs(weight - previous).sum()
         gross = float(np.dot(weight, next_return))
+        if transaction_cost * turnover >= 1.0:
+            raise ValueError("transaction costs consume the entire portfolio")
         net_returns[index] = (1.0 + gross) * (1.0 - transaction_cost * turnover) - 1.0
         turnovers[index] = turnover
         drifted = weight * (1.0 + next_return)
         total = drifted.sum()
-        previous = drifted / total if total > 1e-12 else weight
-    wealth = np.cumprod(1.0 + np.clip(net_returns, -0.999, None))
+        previous = drifted / total
+    wealth = np.cumprod(1.0 + net_returns)
     return net_returns, wealth, turnovers
 
 
@@ -66,8 +85,10 @@ def backtest_metrics(
     returns = np.asarray(net_returns, dtype=np.float64)
     if len(returns) == 0:
         raise ValueError("cannot calculate metrics for an empty backtest")
+    if not np.isfinite(returns).all() or np.any(returns <= -1.0):
+        raise ValueError("net returns must be finite and greater than -1")
     if wealth is None:
-        wealth = np.cumprod(1.0 + np.clip(returns, -0.999, None))
+        wealth = np.cumprod(1.0 + returns)
     wealth = np.asarray(wealth, dtype=np.float64)
     cumulative = float(wealth[-1])
     annualized_return = float(cumulative ** (periods_per_year / len(returns)) - 1.0)

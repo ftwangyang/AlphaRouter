@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alpharouter"
+version = "0.2.0"
+description = "Portfolio expert routing with confidence-gated committee voting"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy>=1.24,<3",
+    "pandas>=2.0,<3",
+    "scipy>=1.10,<2",
+    "torch>=2.0,<3",
+]
+
+[tool.setuptools.packages.find]
+include = ["alpharouter*"]
+
+[tool.black]
+line-length = 88
+target-version = ["py39"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
